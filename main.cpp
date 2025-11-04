@@ -143,6 +143,7 @@ void displayGrid();
 void runSimulation();
 
 // Function prototypes for different Idle functions, Only 1 of them need to be registered as an OpenGL call back function
+// Choose one based on what you would like to measure
 void idleUncappedFPS();
 void idleTimeMillionIterations();
 void idleCappedFPS();
