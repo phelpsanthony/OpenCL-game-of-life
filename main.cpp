@@ -144,9 +144,9 @@ void runSimulation();
 
 // Function prototypes for different Idle functions, Only 1 of them need to be registered as an OpenGL call back function
 // Choose one based on what you would like to measure
-void idleUncappedFPS();
-void idleTimeMillionIterations();
-void idleCappedFPS();
+void idleUncappedFPS(); //This idle function doesn't cap the FPS and is called as often as possible without sleeping
+void idleTimeMillionIterations();   //This function calculates the average FPS over a million iterations and times it
+void idleCappedFPS();   //This function caps the FPS at 35 to stop jitter in the display
 
 // Function protype for functions that aren't necessary
 void printGrid();
@@ -301,7 +301,7 @@ void printGrid() {
     vector<int> grid(SIZE);
     clEnqueueReadBuffer(clqueue, currentGrid, CL_TRUE, 0, sizeof(int) * SIZE, grid.data(), 0, nullptr, nullptr);
 
-    for (int y = 0; y < HEIGHT; y++) { // print only first 5 rows for readability
+    for (int y = 0; y < HEIGHT; y++) {
         for (int x = 0; x < WIDTH; x++) {
             cout << grid[y * WIDTH + x] << "\t";
         }
@@ -370,7 +370,7 @@ void idleUncappedFPS() {
     runSimulation();
 
     frameCount++;
-
+    glutPostRedisplay();
     // Measure elapsed time
     auto now = chrono::high_resolution_clock::now();
     chrono::duration<double> elapsed = now - lastTime;
@@ -383,7 +383,7 @@ void idleUncappedFPS() {
     }
 
 
-    glutPostRedisplay();
+    // glutPostRedisplay();
 }
 
 void idleTimeMillionIterations() {
@@ -391,6 +391,7 @@ void idleTimeMillionIterations() {
     static auto startTime = chrono::high_resolution_clock::now();
 
     runSimulation();
+    glutPostRedisplay();
     frameCount++;
 
     if (frameCount >= 1000000) {
@@ -404,8 +405,16 @@ void idleTimeMillionIterations() {
         frameCount = 0;
         startTime = chrono::high_resolution_clock::now();
     }
+    else if (frameCount % 1000 == 0) {
+        auto now = chrono::high_resolution_clock::now();
+        chrono::duration<double> elapsed = now - startTime;
+        double currentFPS = frameCount / elapsed.count();
+        cout << "Progress: " << frameCount << " / 1000000 frames"
+             << " | Current FPS: " << currentFPS << endl;
+    }
 
-    glutPostRedisplay();
+
+    // glutPostRedisplay();
 }
 
 void idleCappedFPS() {
@@ -415,7 +424,7 @@ void idleCappedFPS() {
     runSimulation();
     frameCount++;
 
-    const double targetFPS = 35.0;
+    const double targetFPS = 40.0;
     const double frameTime = 1.0 / targetFPS; // seconds per frame
     auto now = chrono::high_resolution_clock::now();
     chrono::duration<double> elapsed = now - lastTime;
