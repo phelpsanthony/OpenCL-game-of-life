@@ -30,7 +30,7 @@ cl_mem nextGrid;
 GLuint pbo;
 cl_mem clPbo;
 
-// Kernel source
+// Kernel source, This is the code that is compiled by OpenCL to be executed on the GPU
 const char *KernelSource = R"CLC(
 __kernel void computeNextState(__global int *currentGrid, __global int *nextGrid, const int width, const int height,
 const int numOfSpecies, const int conflictResolution, __global uchar3 *pbo){
@@ -133,6 +133,62 @@ const int numOfSpecies, const int conflictResolution, __global uchar3 *pbo){
 }
 )CLC";
 
+// Function prototypes for functions that are necessary
+void setupOpenCL();
+void cleanupOpenCL();
+void runKernel(const string &kernelName, int numOfSpecies);
+void initGrid(int numOfSpecies);
+void setupPboBuffer(int width, int height);
+void displayGrid();
+void runSimulation();
+
+// Function prototypes for different Idle functions, Only 1 of them need to be registered as an OpenGL call back function
+void idleUncappedFPS();
+void idleTimeMillionIterations();
+void idleCappedFPS();
+
+// Function protype for functions that aren't necessary
+void printGrid();
+
+int main(int argc, char **argv) {
+    // Randomly decide number of species
+    random_device rd;
+    default_random_engine generator(rd());
+    uniform_int_distribution<int> speciesGenerator(5, 10);
+    numOfSpecies = speciesGenerator(generator);
+    cout << "Number of species: " << numOfSpecies << endl;
+
+    // Setup OpenGL
+    glutInit(&argc, argv);
+    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
+    glutInitWindowSize(WIDTH, HEIGHT);
+    glutCreateWindow("Game Of Life Using OpenCL and OpenGL");
+
+    // Make sure OpenGL context is current (GLUT should do this automatically)
+    // Initialize GLEW (if needed)
+    GLenum err = glewInit();
+    if (GLEW_OK != err) {
+        cerr << "GLEW Error: " << glewGetErrorString(err) << endl;
+        return 1;
+    }
+
+    setupOpenCL();
+
+    cout << "Initializing Grid ...\n";
+    initGrid(numOfSpecies);
+
+    setupPboBuffer(WIDTH, HEIGHT);
+
+    // Register GLUT callback functions
+    glutDisplayFunc(displayGrid);
+    glutIdleFunc(idleCappedFPS);
+
+    // Start main GLUT loop
+    glutMainLoop();
+
+    cleanupOpenCL();
+    return 0;
+}
 
 void setupOpenCL() {
     cl_int err;
@@ -329,10 +385,6 @@ void idleUncappedFPS() {
     glutPostRedisplay();
 }
 
-#include <thread>  // make sure this is included
-
-
-
 void idleTimeMillionIterations() {
     static int frameCount = 0;
     static auto startTime = chrono::high_resolution_clock::now();
@@ -393,45 +445,4 @@ void idleCappedFPS() {
 
     lastTime = now;
     glutPostRedisplay();
-}
-
-
-int main(int argc, char **argv) {
-    // Randomly decide number of species
-    random_device rd;
-    default_random_engine generator(rd());
-    uniform_int_distribution<int> speciesGenerator(5, 10);
-    numOfSpecies = speciesGenerator(generator);
-    cout << "Number of species: " << numOfSpecies << endl;
-
-    // Setup OpenGL
-    glutInit(&argc, argv);
-    glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
-    glutInitWindowSize(WIDTH, HEIGHT);
-    glutCreateWindow("Game Of Life Using OpenCL and OpenGL");
-
-    // Make sure OpenGL context is current (GLUT should do this automatically)
-    // Initialize GLEW (if needed)
-    GLenum err = glewInit();
-    if (GLEW_OK != err) {
-        cerr << "GLEW Error: " << glewGetErrorString(err) << endl;
-        return 1;
-    }
-
-    setupOpenCL();
-
-    cout << "Initializing Grid ...\n";
-    initGrid(numOfSpecies);
-
-    setupPboBuffer(WIDTH, HEIGHT);
-
-    // Register GLUT callback functions
-    glutDisplayFunc(displayGrid);
-    glutIdleFunc(idleCappedFPS);
-
-    // Start main GLUT loop
-    glutMainLoop();
-
-    cleanupOpenCL();
-    return 0;
 }
