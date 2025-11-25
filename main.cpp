@@ -11,26 +11,22 @@
 
 using namespace std;
 
-// Grid constants
 const int WIDTH = 1024;
 const int HEIGHT = 768;
 const int SIZE = WIDTH * HEIGHT;
 int numOfSpecies;
 
-// OpenCL global objects
-cl_platform_id platform;
-cl_device_id device;
+cl_platform_id platform_GPU;
+cl_device_id device_GPU;
 cl_context context;
-cl_command_queue clqueue;
-cl_program program;
-cl_mem currentGrid;
-cl_mem nextGrid;
-
-// OpenGL Pixel Buffer Object and OpenCL buffer for it
+cl_command_queue clqueue_GPU_compute; // Coma=mand queue for the GPU
+cl_command_queue clqueue_GPU_swap;    // Command queue for the CPU kernel that is being simulated on the GPU because I'm a mac user :(
+cl_program program_GPU;
+cl_mem currentGrid_GPU;
+cl_mem nextGrid_GPU;
 GLuint pbo;
-cl_mem clPbo;
+cl_mem clPbo_GPU;
 
-// Kernel source, This is the code that is compiled by OpenCL to be executed on the GPU
 const char *KernelSource = R"CLC(
 __kernel void computeNextState(__global int *currentGrid, __global int *nextGrid, const int width, const int height,
 const int numOfSpecies, const int conflictResolution, __global uchar3 *pbo){
@@ -131,213 +127,164 @@ const int numOfSpecies, const int conflictResolution, __global uchar3 *pbo){
     pbo[index] = color;
 
 }
+
+// This kernel simulates a CPU kernel which would swap the pointers to the current and next grid
+// Because it's a GPU I'm just swapping each cell with each work item and there is 1 work item per cell
+// In a CPU I would just swap the pointers like I did in the host program in assignment 3
+__kernel void swapGrids(__global int* currentGrid, __global int* nextGrid){
+    int idx = get_global_id(0);
+
+    if(idx >= get_global_size(0)) return;
+
+    // Swap the values in each grid
+    int temp = currentGrid[idx];
+    currentGrid[idx] = nextGrid[idx];
+    nextGrid[idx] = temp;
+}
 )CLC";
 
-// Function prototypes for functions that are necessary
 void setupOpenCL();
 void cleanupOpenCL();
-void runKernel(const string &kernelName, int numOfSpecies);
+void runKernels();
 void initGrid(int numOfSpecies);
 void setupPboBuffer(int width, int height);
 void displayGrid();
 void runSimulation();
+void idleCappedFPS();
+void idleTimeMillionIterations();
+void idleUncappedFPS();
 
-// Function prototypes for different Idle functions, Only 1 of them need to be registered as an OpenGL call back function
-// Choose one based on what you would like to measure
-void idleUncappedFPS(); //This idle function doesn't cap the FPS and is called as often as possible without sleeping
-void idleTimeMillionIterations();   //This function calculates the average FPS over a million iterations and times it
-void idleCappedFPS();   //This function caps the FPS at 35 to stop jitter in the display
-
-// Function protype for functions that aren't necessary
-void printGrid();
-
-int main(int argc, char **argv) {
-    // Randomly decide number of species
+int main(int argc, char **argv){
     random_device rd;
     default_random_engine generator(rd());
-    uniform_int_distribution<int> speciesGenerator(5, 10);
+    uniform_int_distribution<int> speciesGenerator(5,10);
     numOfSpecies = speciesGenerator(generator);
     cout << "Number of species: " << numOfSpecies << endl;
 
-    // Setup OpenGL
     glutInit(&argc, argv);
     glutInitDisplayMode(GLUT_DOUBLE | GLUT_RGB);
     glutInitWindowSize(WIDTH, HEIGHT);
     glutCreateWindow("Game Of Life Using OpenCL and OpenGL");
 
-    // Make sure OpenGL context is current (GLUT should do this automatically)
-    // Initialize GLEW (if needed)
     GLenum err = glewInit();
-    if (GLEW_OK != err) {
+    if(GLEW_OK != err){
         cerr << "GLEW Error: " << glewGetErrorString(err) << endl;
         return 1;
     }
 
     setupOpenCL();
-
-    cout << "Initializing Grid ...\n";
     initGrid(numOfSpecies);
-
     setupPboBuffer(WIDTH, HEIGHT);
 
-    // Register GLUT callback functions
     glutDisplayFunc(displayGrid);
     glutIdleFunc(idleCappedFPS);
 
-    // Start main GLUT loop
     glutMainLoop();
-
     cleanupOpenCL();
     return 0;
 }
 
-void setupOpenCL() {
+void setupOpenCL(){
     cl_int err;
-
-    // Get platform
     cl_uint numPlatforms;
-    clGetPlatformIDs(0, nullptr, &numPlatforms);
+    clGetPlatformIDs(0,nullptr,&numPlatforms);
     vector<cl_platform_id> platforms(numPlatforms);
     clGetPlatformIDs(numPlatforms, platforms.data(), nullptr);
-    platform = platforms[0];
+    platform_GPU = platforms[0];
 
-    // Get GPU device
-    clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, nullptr);
+    clGetDeviceIDs(platform_GPU, CL_DEVICE_TYPE_GPU, 1, &device_GPU, nullptr);
 
-    // Get current OpenGL context and share group
     CGLContextObj glContext = CGLGetCurrentContext();
     CGLShareGroupObj sharegroup = CGLGetShareGroup(glContext);
 
-    // Context properties for OpenCL/OpenGL interop
     cl_context_properties props[] = {
         CL_CONTEXT_PROPERTY_USE_CGL_SHAREGROUP_APPLE,
         (cl_context_properties)sharegroup,
         0
     };
+    context = clCreateContext(props, 1, &device_GPU, nullptr, nullptr, &err);
+    if(err != CL_SUCCESS){ cerr << "Failed to create OpenCL context\n"; exit(1); }
 
-    // Create OpenCL context with share group
-    context = clCreateContext(props, 1, &device, nullptr, nullptr, &err);
-    if (err != CL_SUCCESS) {
-        cerr << "Failed to create OpenCL context: " << err << endl;
-        exit(1);
-    }
+    // Simulate CPU usage by creating a separate command queue for the "CPU kerel"
+    clqueue_GPU_compute = clCreateCommandQueue(context, device_GPU, CL_QUEUE_PROFILING_ENABLE, &err);
+    clqueue_GPU_swap    = clCreateCommandQueue(context, device_GPU, CL_QUEUE_PROFILING_ENABLE, &err);
 
+    // create buffers to hold the current and next states of the game
+    currentGrid_GPU = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int)*SIZE, nullptr, &err);
+    nextGrid_GPU    = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int)*SIZE, nullptr, &err);
 
-    // Create queue
-    clqueue = clCreateCommandQueue(context, device, CL_QUEUE_PROFILING_ENABLE, &err);
+    program_GPU = clCreateProgramWithSource(context,1,&KernelSource,nullptr,&err);
+    clBuildProgram(program_GPU,1,&device_GPU,nullptr,nullptr,nullptr);
 
-    // Create buffer
-    currentGrid = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * SIZE, nullptr, &err);
-    nextGrid = clCreateBuffer(context, CL_MEM_READ_WRITE, sizeof(int) * SIZE, nullptr, &err);
-
-    // Compile program
-    program = clCreateProgramWithSource(context, 1, &KernelSource, nullptr, &err);
-    clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
-
-    // Print build log
     size_t logSize;
-    clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &logSize);
-    if (logSize > 1) {
+    clGetProgramBuildInfo(program_GPU,device_GPU,CL_PROGRAM_BUILD_LOG,0,nullptr,&logSize);
+    if(logSize>1){
         vector<char> log(logSize);
-        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, logSize, log.data(), nullptr);
+        clGetProgramBuildInfo(program_GPU,device_GPU,CL_PROGRAM_BUILD_LOG,logSize,log.data(),nullptr);
         cout << "Build Log:\n" << log.data() << endl;
     }
 }
 
-void cleanupOpenCL() {
-    clReleaseMemObject(currentGrid);
-    clReleaseMemObject(nextGrid);
-    clReleaseProgram(program);
-    clReleaseCommandQueue(clqueue);
+void cleanupOpenCL(){
+    clReleaseMemObject(currentGrid_GPU);
+    clReleaseMemObject(nextGrid_GPU);
+    clReleaseProgram(program_GPU);
+    clReleaseCommandQueue(clqueue_GPU_compute);
+    clReleaseCommandQueue(clqueue_GPU_swap);
     clReleaseContext(context);
 }
 
-
-void runKernel(const string &kernelName, int numOfSpecies) {
+void runKernels(){
     cl_int err;
-    cl_kernel kernel = clCreateKernel(program, kernelName.c_str(), &err);
+    cl_kernel gpuKernel = clCreateKernel(program_GPU,"computeNextState",&err);
+    cl_kernel cpuKernel    = clCreateKernel(program_GPU,"swapGrids",&err);
 
+    // generate random number for conflict resolution
     random_device rd;
     default_random_engine generator(rd());
-    uniform_int_distribution<int> conflictResolutionGenerator(0, 1);
+    uniform_int_distribution<int> conflictResolutionGenerator(0,1);
     int conflictResolution = conflictResolutionGenerator(generator);
 
 
-    int width = WIDTH;
-    int height = HEIGHT;
-    err = clEnqueueAcquireGLObjects(clqueue, 1, &clPbo, 0, nullptr, nullptr);
+    // set arguments for the GPU kernel
+    clSetKernelArg(gpuKernel,0,sizeof(cl_mem),&currentGrid_GPU);
+    clSetKernelArg(gpuKernel,1,sizeof(cl_mem),&nextGrid_GPU);
+    clSetKernelArg(gpuKernel,2,sizeof(int),&WIDTH);
+    clSetKernelArg(gpuKernel,3,sizeof(int),&HEIGHT);
+    clSetKernelArg(gpuKernel,4,sizeof(int),&numOfSpecies);
+    clSetKernelArg(gpuKernel,5,sizeof(int),&conflictResolution);
+    clSetKernelArg(gpuKernel,6,sizeof(cl_mem),&clPbo_GPU);
 
-    clSetKernelArg(kernel, 0, sizeof(cl_mem), &currentGrid);
-    clSetKernelArg(kernel, 1, sizeof(cl_mem), &nextGrid);
-    clSetKernelArg(kernel, 2, sizeof(int), &width);
-    clSetKernelArg(kernel, 3, sizeof(int), &height);
-    clSetKernelArg(kernel, 4, sizeof(int), &numOfSpecies);
-    clSetKernelArg(kernel, 5, sizeof(int), &conflictResolution);
-    clSetKernelArg(kernel, 6, sizeof(cl_mem), &clPbo);
+    err = clEnqueueAcquireGLObjects(clqueue_GPU_compute,1,&clPbo_GPU,0,nullptr,nullptr);
 
-    size_t globalWorkSize[2] = { (size_t)WIDTH, (size_t)HEIGHT };
+    size_t global2D[2] = {WIDTH, HEIGHT};
+    cl_event computeEvent;
+    clEnqueueNDRangeKernel(clqueue_GPU_compute, gpuKernel, 2, nullptr, global2D, nullptr, 0,nullptr,&computeEvent);
 
-    cl_event event;
-    clEnqueueNDRangeKernel(clqueue, kernel, 2, nullptr, globalWorkSize, nullptr, 0, nullptr, &event);
-    clWaitForEvents(1, &event);
+    // Swap kernel waits for compute kernel
+    clSetKernelArg(cpuKernel,0,sizeof(cl_mem),&currentGrid_GPU);
+    clSetKernelArg(cpuKernel,1,sizeof(cl_mem),&nextGrid_GPU);
+    size_t global1D = SIZE;
+    cl_event swapEvent;
 
-    clEnqueueReleaseGLObjects(clqueue, 1, &clPbo, 0, nullptr, nullptr);
-    clFinish(clqueue);
+    // Send CPU kernel to command queue and wait for GPU kernel to finish computing next state
+    clEnqueueNDRangeKernel(clqueue_GPU_swap, cpuKernel, 1, nullptr, &global1D, nullptr, 1, &computeEvent, &swapEvent);
 
-    // Get execution time in nanoseconds
-    cl_ulong timeStart, timeEnd;
-    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_START, sizeof(timeStart), &timeStart, nullptr);
-    clGetEventProfilingInfo(event, CL_PROFILING_COMMAND_END, sizeof(timeEnd), &timeEnd, nullptr);
+    clWaitForEvents(1,&swapEvent);
 
-    double execTimeMS = (timeEnd - timeStart) / 1e6; // convert ns to ms
-    double fps = 1000.0 / execTimeMS;
+    clEnqueueReleaseGLObjects(clqueue_GPU_compute,1,&clPbo_GPU,0,nullptr,nullptr);
+    clFinish(clqueue_GPU_compute);
+    clFinish(clqueue_GPU_swap);
 
-
-    clReleaseEvent(event);
-    clReleaseKernel(kernel);
+    clReleaseEvent(computeEvent);
+    clReleaseEvent(swapEvent);
+    clReleaseKernel(gpuKernel);
+    clReleaseKernel(cpuKernel);
 }
 
-void printGrid() {
-    vector<int> grid(SIZE);
-    clEnqueueReadBuffer(clqueue, currentGrid, CL_TRUE, 0, sizeof(int) * SIZE, grid.data(), 0, nullptr, nullptr);
-
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            cout << grid[y * WIDTH + x] << "\t";
-        }
-        cout << endl;
-    }
-    cout << "...\n";
-}
-
-void initGrid(int numOfSpecies) {
-    random_device rd;
-    default_random_engine generator(rd());
-    uniform_int_distribution<int> speciesIdGenerator(0, numOfSpecies - 1);
-
-    vector<int> grid(SIZE);
-    for (int i = 0; i < SIZE; i++) {
-        grid[i] = speciesIdGenerator(generator);
-    }
-
-    // Copy the CPU-initialized grid to the GPU buffer
-    clEnqueueWriteBuffer(clqueue, currentGrid, CL_TRUE, 0, sizeof(int) * SIZE, grid.data(), 0, nullptr, nullptr);
-}
-
-void setupPboBuffer(int width, int height) {
-    // Generate PBO
-    glGenBuffers(1, &pbo);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
-    glBufferData(GL_PIXEL_UNPACK_BUFFER, width * height * 3 * sizeof(GLubyte), nullptr, GL_DYNAMIC_DRAW);
-    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
-
-    // Create OpenCL buffer from OpenGL buffer
-    cl_int err;
-    clPbo = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pbo, &err);
-    if (err != CL_SUCCESS) {
-        cerr << "Error creating PBO" << endl;
-        exit(1);
-    }
+void runSimulation(){
+    // run the GPU and CPU kernels which compute the next state and then swap the grids
+    runKernels();
 }
 
 void displayGrid() {
@@ -353,68 +300,35 @@ void displayGrid() {
     glutSwapBuffers();
 }
 
-void runSimulation() {
-    // Run kernel to compute the next state that should be displayed
-    runKernel("computeNextState", numOfSpecies);
+void initGrid(int numOfSpecies) {
+    random_device rd;
+    default_random_engine generator(rd());
+    uniform_int_distribution<int> speciesIdGenerator(0, numOfSpecies - 1);
 
-    //Swap currentGrid and NextGrid
-    swap(currentGrid, nextGrid);
+    vector<int> grid(SIZE);
+    for (int i = 0; i < SIZE; i++) {
+        grid[i] = speciesIdGenerator(generator);
+    }
+
+    // Copy the CPU-initialized grid to the GPU buffer
+    clEnqueueWriteBuffer(clqueue_GPU_compute, currentGrid_GPU, CL_TRUE, 0, sizeof(int) * SIZE, grid.data(), 0, nullptr, nullptr);
 }
 
-void idleUncappedFPS() {
 
-    // Static variables persist across function calls
-    static auto lastTime = chrono::high_resolution_clock::now();
-    static int frameCount = 0;
+void setupPboBuffer(int width, int height) {
+    // Generate PBO
+    glGenBuffers(1, &pbo);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, pbo);
+    glBufferData(GL_PIXEL_UNPACK_BUFFER, width * height * 3 * sizeof(GLubyte), nullptr, GL_DYNAMIC_DRAW);
+    glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
 
-    runSimulation();
-
-    frameCount++;
-    glutPostRedisplay();
-    // Measure elapsed time
-    auto now = chrono::high_resolution_clock::now();
-    chrono::duration<double> elapsed = now - lastTime;
-    if (elapsed.count() >= 1.0) {  // every 1 second
-        double fps = frameCount / elapsed.count();
-        cout << "FPS: " << fps << endl;
-
-        frameCount = 0;
-        lastTime = now;
+    // Create OpenCL buffer from OpenGL buffer
+    cl_int err;
+    clPbo_GPU = clCreateFromGLBuffer(context, CL_MEM_WRITE_ONLY, pbo, &err);
+    if (err != CL_SUCCESS) {
+        cerr << "Error creating PBO" << endl;
+        exit(1);
     }
-
-
-    // glutPostRedisplay();
-}
-
-void idleTimeMillionIterations() {
-    static int frameCount = 0;
-    static auto startTime = chrono::high_resolution_clock::now();
-
-    runSimulation();
-    glutPostRedisplay();
-    frameCount++;
-
-    if (frameCount >= 1000000) {
-        auto endTime = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = endTime - startTime;
-        double avgFPS = frameCount / elapsed.count();
-        cout << "Completed " << frameCount << " frames in "
-                     << elapsed.count() << " seconds. Average FPS: "
-                     << avgFPS << endl;
-        // Reset counters for the next measurement
-        frameCount = 0;
-        startTime = chrono::high_resolution_clock::now();
-    }
-    else if (frameCount % 1000 == 0) {
-        auto now = chrono::high_resolution_clock::now();
-        chrono::duration<double> elapsed = now - startTime;
-        double currentFPS = frameCount / elapsed.count();
-        cout << "Progress: " << frameCount << " / 1000000 frames"
-             << " | Current FPS: " << currentFPS << endl;
-    }
-
-
-    // glutPostRedisplay();
 }
 
 void idleCappedFPS() {
@@ -455,4 +369,60 @@ void idleCappedFPS() {
 
     lastTime = now;
     glutPostRedisplay();
+}
+
+void idleTimeMillionIterations() {
+    static int frameCount = 0;
+    static auto startTime = chrono::high_resolution_clock::now();
+
+    runSimulation();
+    glutPostRedisplay();
+    frameCount++;
+
+    if (frameCount >= 1000000) {
+        auto endTime = chrono::high_resolution_clock::now();
+        chrono::duration<double> elapsed = endTime - startTime;
+        double avgFPS = frameCount / elapsed.count();
+        cout << "Completed " << frameCount << " frames in "
+                     << elapsed.count() << " seconds. Average FPS: "
+                     << avgFPS << endl;
+        // Reset counters for the next measurement
+        frameCount = 0;
+        startTime = chrono::high_resolution_clock::now();
+    }
+    else if (frameCount % 1000 == 0) {
+        auto now = chrono::high_resolution_clock::now();
+        chrono::duration<double> elapsed = now - startTime;
+        double currentFPS = frameCount / elapsed.count();
+        cout << "Progress: " << frameCount << " / 1000000 frames"
+             << " | Current FPS: " << currentFPS << endl;
+    }
+
+
+    // glutPostRedisplay();
+}
+
+void idleUncappedFPS() {
+
+    // Static variables persist across function calls
+    static auto lastTime = chrono::high_resolution_clock::now();
+    static int frameCount = 0;
+
+    runSimulation();
+
+    frameCount++;
+    glutPostRedisplay();
+    // Measure elapsed time
+    auto now = chrono::high_resolution_clock::now();
+    chrono::duration<double> elapsed = now - lastTime;
+    if (elapsed.count() >= 1.0) {  // every 1 second
+        double fps = frameCount / elapsed.count();
+        cout << "FPS: " << fps << endl;
+
+        frameCount = 0;
+        lastTime = now;
+    }
+
+
+    // glutPostRedisplay();
 }
